@@ -4,31 +4,33 @@ using System.Threading.Tasks;
 using ClassIsland.Shared.Enums;
 using ClassIsland.Shared.IPC;
 using ClassIsland.Shared.IPC.Abstractions.Services;
+using dotnetCampus.Ipc.CompilerServices.GeneratedProxies;
+using dotnetCampus.Ipc.Pipes;
 using Microsoft.Extensions.Logging;
 using SecRandom.Core.Models.Linkage;
 
 namespace SecRandom.Services.Linkage;
 
-public sealed class ClassIslandScheduleSource : ICourseScheduleSource
+public sealed class ClassIslandScheduleSource(ILogger<ClassIslandScheduleSource> logger) : ICourseScheduleSource
 {
-    private readonly ClassIslandIpcConnection _ipcConnection;
-    private readonly ILogger<ClassIslandScheduleSource> _logger;
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan JsonRouteReadyDelay = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
+    private readonly ILogger<ClassIslandScheduleSource> _logger = logger;
+    private readonly SemaphoreSlim _connectionGate = new(1, 1);
+    private IpcClient? _client;
+    private IPublicLessonsService? _lessons;
     private string _lastKnownCourseName = string.Empty;
     private DateOnly? _lastKnownCourseDate;
+    private DateTime? _lastKnownCourseEnd;
+    private DateTimeOffset _nextConnectAttempt = DateTimeOffset.MinValue;
 
     public string SourceName => "ClassIsland";
     public event EventHandler? StateChanged;
 
-    public ClassIslandScheduleSource(ClassIslandIpcConnection ipcConnection, ILogger<ClassIslandScheduleSource> logger)
-    {
-        _ipcConnection = ipcConnection;
-        _logger = logger;
-        _ipcConnection.StateChanged += (_, _) => StateChanged?.Invoke(this, EventArgs.Empty);
-    }
-
     public async Task<CourseScheduleSnapshot> GetSnapshotAsync(CancellationToken cancellationToken = default)
     {
-        var lessons = await _ipcConnection.GetLessonsServiceAsync(cancellationToken).ConfigureAwait(false);
+        var lessons = await GetLessonsAsync(cancellationToken).ConfigureAwait(false);
         if (lessons is null)
             return CourseScheduleSnapshot.Unavailable(SourceName, ScheduleErrorCodes.ClassIslandUnavailable);
 
@@ -40,13 +42,14 @@ public sealed class ClassIslandScheduleSource : ICourseScheduleSource
                 return CourseScheduleSnapshot.Unavailable(SourceName, ScheduleErrorCodes.ClassIslandScheduleDisabled);
             if (!lessons.IsClassPlanLoaded)
                 return CourseScheduleSnapshot.Unavailable(SourceName, ScheduleErrorCodes.ClassIslandScheduleUnloaded);
-            if (!lessons.IsLessonConfirmed)
-                return CourseScheduleSnapshot.Unavailable(SourceName, ScheduleErrorCodes.ClassIslandTimeUnconfirmed);
 
             var state = lessons.CurrentState switch
             {
                 TimeState.OnClass => CourseTimeState.OnClass,
-                TimeState.Breaking => CourseTimeState.Breaking,
+                // ClassIsland 在最后一节课后报告 AfterSchool，在第一节课前或时间表未覆盖的间隙报告 None，
+                // PrepareOnClass 为预留的上课准备状态。这些都是明确的非上课时段，与 CSES 源一致视为
+                // 课间并保持可用，由启用窗口决定是否豁免。
+                TimeState.Breaking or TimeState.None or TimeState.AfterSchool or TimeState.PrepareOnClass => CourseTimeState.Breaking,
                 _ => CourseTimeState.Unknown
             };
             if (state == CourseTimeState.Unknown)
@@ -68,6 +71,9 @@ public sealed class ClassIslandScheduleSource : ICourseScheduleSource
             var currentItem = lessons.CurrentTimeLayoutItem;
             var start = ParseTime(currentItem?.StartTime, now.TimeOfDay);
             var end = ParseTime(currentItem?.EndTime, now.TimeOfDay);
+            // 记录当前课程结束时间，供课后禁用延迟窗口计算使用
+            if (state == CourseTimeState.OnClass && currentItem?.EndTime is { } endTime)
+                _lastKnownCourseEnd = now.Date + endTime;
             var current = string.IsNullOrEmpty(currentName)
                 ? null
                 : new CourseInfo(currentName, DayOfWeekNumber(now.DayOfWeek), TimeOnly.FromTimeSpan(start), TimeOnly.FromTimeSpan(end));
@@ -85,8 +91,12 @@ public sealed class ClassIslandScheduleSource : ICourseScheduleSource
             var currentCourseRemaining = state == CourseTimeState.OnClass
                 ? Positive(lessons.OnBreakingTimeLeftTime)
                 : null;
-            // Version only includes stable identifiers (schedule index + state), NOT countdown timers
-            // This prevents false StateChanged triggers from continuously changing OnClassLeftTime/OnBreakingTimeLeftTime
+            // 与 CSES 源一致：课后经过的时间驱动课后禁用延迟窗口与刷新调度
+            var sincePreviousEnd = _lastKnownCourseEnd is { } lastEnd &&
+                lastEnd.Date == now.Date &&
+                lastEnd.TimeOfDay <= now.TimeOfDay
+                ? (TimeSpan?)(now - lastEnd)
+                : null;
             return new CourseScheduleSnapshot(
                 true,
                 state,
@@ -95,15 +105,93 @@ public sealed class ClassIslandScheduleSource : ICourseScheduleSource
                 next,
                 currentCourseRemaining,
                 nextCourseIn,
-                null,
+                sincePreviousEnd,
                 SourceName,
                 $"{lessons.CurrentSelectedIndex}:{lessons.CurrentState}");
         }
         catch (Exception exception)
         {
             _logger.LogDebug(exception, "读取 ClassIsland 日程状态失败。");
+            InvalidateConnection();
             return CourseScheduleSnapshot.Unavailable(SourceName, ScheduleErrorCodes.ClassIslandReadFailed);
         }
+    }
+
+    private async Task<IPublicLessonsService?> GetLessonsAsync(CancellationToken cancellationToken)
+    {
+        if (_lessons is not null)
+            return _lessons;
+        if (DateTimeOffset.UtcNow < _nextConnectAttempt)
+            return null;
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_lessons is not null)
+                return _lessons;
+            if (DateTimeOffset.UtcNow < _nextConnectAttempt)
+                return null;
+
+            var client = new IpcClient();
+            client.JsonIpcProvider.AddNotifyHandler(IpcRoutedNotifyIds.OnClassNotifyId, OnClassIslandStateChanged);
+            client.JsonIpcProvider.AddNotifyHandler(IpcRoutedNotifyIds.OnBreakingTimeNotifyId, OnClassIslandStateChanged);
+            client.JsonIpcProvider.AddNotifyHandler(IpcRoutedNotifyIds.OnAfterSchoolNotifyId, OnClassIslandStateChanged);
+            client.JsonIpcProvider.AddNotifyHandler(IpcRoutedNotifyIds.CurrentTimeStateChangedNotifyId, OnClassIslandStateChanged);
+            await client.Connect().WaitAsync(ConnectTimeout, cancellationToken).ConfigureAwait(false);
+            // ClassIsland establishes its JSON routed peer asynchronously after the transport connection.
+            await Task.Delay(JsonRouteReadyDelay, cancellationToken).ConfigureAwait(false);
+            if (client.PeerProxy is null)
+            {
+                DisposeClient(client);
+                ScheduleRetry();
+                return null;
+            }
+
+            _client = client;
+            _lessons = GeneratedIpcFactory.CreateIpcProxy<IPublicLessonsService>(client.Provider, client.PeerProxy);
+            _nextConnectAttempt = DateTimeOffset.MinValue;
+            _logger.LogInformation("已连接到 ClassIsland IPC：管道={PipeName}。", IpcClient.PipeName);
+            return _lessons;
+        }
+        catch (Exception exception)
+        {
+            _logger.LogDebug(exception, "连接 ClassIsland IPC 失败，将在 {RetryDelay} 后重试。", RetryDelay);
+            InvalidateConnection();
+            ScheduleRetry();
+            return null;
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
+    private void OnClassIslandStateChanged()
+    {
+        StateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void InvalidateConnection()
+    {
+        _lessons = null;
+        DisposeClient(_client);
+        _client = null;
+    }
+
+    private static void DisposeClient(IpcClient? client)
+    {
+        try
+        {
+            client?.Provider.Dispose();
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private void ScheduleRetry()
+    {
+        _nextConnectAttempt = DateTimeOffset.UtcNow.Add(RetryDelay);
     }
 
     private static string NormalizeSubjectName(string? name)

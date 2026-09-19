@@ -101,14 +101,7 @@ public partial class SecuritySettingsPage : UserControl, INotifyPropertyChanged
             return;
         }
 
-        if (TopLevel.GetTopLevel(this) is not { } xamlRoot)
-        {
-            RefreshSecurityState();
-            return;
-        }
-
         await ApplySecuritySettingsUpdateAsync(
-            xamlRoot,
             () =>
             {
                 foreach (var option in FactorOptions)
@@ -171,14 +164,7 @@ public partial class SecuritySettingsPage : UserControl, INotifyPropertyChanged
             requested == Settings.SecurityEnabled)
             return;
 
-        if (TopLevel.GetTopLevel(this) is not { } xamlRoot)
-        {
-            RefreshSecurityState();
-            return;
-        }
-
         await ApplySecuritySettingsUpdateAsync(
-            xamlRoot,
             () => Settings.SecurityEnabled = requested,
             () => toggle.IsChecked = Settings.SecurityEnabled);
     }
@@ -194,14 +180,7 @@ public partial class SecuritySettingsPage : UserControl, INotifyPropertyChanged
         if (requested == current)
             return;
 
-        if (TopLevel.GetTopLevel(this) is not { } xamlRoot)
-        {
-            RefreshSecurityState();
-            return;
-        }
-
         await ApplySecuritySettingsUpdateAsync(
-            xamlRoot,
             () => setValue(requested),
             () => toggle.IsChecked = current);
     }
@@ -248,8 +227,7 @@ public partial class SecuritySettingsPage : UserControl, INotifyPropertyChanged
 
     private async void ManageTotp_OnClick(object? sender, RoutedEventArgs e)
     {
-        if (TopLevel.GetTopLevel(this) is not { } xamlRoot) return;
-        var secret = await _securityService.BeginTotpSetupAsync(xamlRoot);
+        var secret = await _securityService.BeginTotpSetupAsync();
         if (secret is null)
         {
             if (!_securityService.GetUiState().HasPassword)
@@ -257,6 +235,7 @@ public partial class SecuritySettingsPage : UserControl, INotifyPropertyChanged
             return;
         }
 
+        if (TopLevel.GetTopLevel(this) is not { } xamlRoot) return;
         var code = await SecuritySetupDialogs.ShowTotpSetupAsync(xamlRoot, secret);
         if (code is not null && await _securityService.ConfirmTotpAsync(secret, code))
             this.ShowSuccessToast(SR.M_TotpSaved);
@@ -272,14 +251,14 @@ public partial class SecuritySettingsPage : UserControl, INotifyPropertyChanged
             await _securityService.GetUsbDevicesAsync());
         if (result is null) return;
         var success = result.UnbindId is not null
-            ? await _securityService.UnbindUsbAsync(xamlRoot, result.UnbindId)
-            : await _securityService.BindUsbAsync(xamlRoot, result.DeviceId!);
+            ? await _securityService.UnbindUsbAsync(result.UnbindId)
+            : await _securityService.BindUsbAsync(result.DeviceId!);
         if (success) this.ShowSuccessToast(SR.M_UsbUpdated);
         else this.ShowErrorToast(SR.M_UsbUpdateFailed);
         RefreshSecurityState();
     }
 
-    private void SudoModeDuration_OnValueChanged(object? sender, NumericUpDownValueChangedEventArgs e)
+private void SudoModeDuration_OnValueChanged(object? sender, NumericUpDownValueChangedEventArgs e)
     {
         if (_refreshing)
             return;
@@ -291,13 +270,13 @@ public partial class SecuritySettingsPage : UserControl, INotifyPropertyChanged
         }
     }
 
-    private async Task ApplySecuritySettingsUpdateAsync(TopLevel xamlRoot, Action update, Action restoreView)
+    private async Task ApplySecuritySettingsUpdateAsync(Action update, Action restoreView)
     {
         _refreshing = true;
         try
         {
             restoreView();
-            await _securityService.UpdateSecuritySettingsAsync(xamlRoot, update);
+            await _securityService.UpdateSecuritySettingsAsync(update);
         }
         finally
         {
